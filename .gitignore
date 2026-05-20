@@ -1,0 +1,37 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.Python
+build/
+dist/
+
+# Virtual environments
+venv/
+.venv/
+env/
+
+# macOS
+.DS_Store
+
+# Editor / tooling
+.claude/
+.vscode/
+.idea/
+
+# Test media (large sample audio/video — keep these local)
+*.mp3
+*.MP3
+*.wav
+*.m4a
+*.flac
+*.ogg
+*.mov
+*.mp4
+*.mkv
+
+# Transcription outputs
+*_outputs/
+outputs/
+*.srt
+*.vtt
