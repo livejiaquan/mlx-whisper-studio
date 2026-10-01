@@ -49,6 +49,11 @@ This creates a `venv/` and installs the dependencies from `requirements.txt`.
   `_2`, `_3`, etc. The same suffix is used for the whole set, including translations.
 - Cancel waits for the worker to stop before cleaning up. Settings are captured
   when you start the queue, so edits during a run apply to the next run.
+- Closing the window also cancels and waits for the worker and its temporary
+  output cleanup. The file list is locked during a run to keep results aligned.
+- The final status reports success, failure, and cancellation counts. Use
+  **Retry Failed / Cancelled** to rerun unfinished items without transcribing
+  already-successful files again; pending items in a cancelled queue are included.
 - Models download on first use and are cached afterward.
 - "Custom" language accepts any Whisper language code (e.g. `zh`, `ja`).
 - "Custom model" accepts a Hugging Face repo ID or a local model path.

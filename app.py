@@ -75,6 +75,7 @@ LANGUAGE_OPTIONS = [
 
 STATUS_STYLES = {
     "Idle": ("•", TEXT_SECONDARY),
+    "Queued": ("•", TEXT_SECONDARY),
     "Processing": ("⟳", ACCENT),
     "Done": ("✓", SUCCESS),
     "Failed": ("✗", ERROR),
@@ -100,11 +101,15 @@ class MLXWhisperApp:
         self.root.configure(bg=BG_MAIN)
 
         self.queue: List[str] = []
+        self.queue_entries: List[FileEntry] = []
+        self.queue_results: List[str] = []
         self.file_entries: List[FileEntry] = []
         self.current_index = -1
         self.current_process: Optional[subprocess.Popen] = None
         self.current_plan: Optional[OutputPlan] = None
         self.cancel_requested = False
+        self.is_running = False
+        self.closing = False
         self.log_queue: "queue.Queue[str]" = queue.Queue()
         self.worker_thread: Optional[threading.Thread] = None
         self.options_visible = True
@@ -112,6 +117,7 @@ class MLXWhisperApp:
 
         self._apply_style()
         self._build_ui()
+        self.root.protocol("WM_DELETE_WINDOW", self._on_close)
         self._poll_logs()
 
     def _apply_style(self):
@@ -515,6 +521,14 @@ class MLXWhisperApp:
             state="disabled",
         )
         self.cancel_button.pack(side=tk.LEFT, padx=(12, 0), ipady=12)
+        self.retry_button = ttk.Button(
+            self.control_frame,
+            text="Retry Failed / Cancelled",
+            style="Secondary.TButton",
+            command=lambda: self._start_queue(retry_only=True),
+            state="disabled",
+        )
+        self.retry_button.pack(side=tk.LEFT, padx=(12, 0), ipady=12)
 
         progress_frame = tk.Frame(
             container,
@@ -603,6 +617,8 @@ class MLXWhisperApp:
         self._add_files(list(paths))
 
     def _add_files(self, files: List[str]):
+        if self.is_running or self.closing:
+            return
         existing = {entry.path for entry in self.file_entries}
         for path in files:
             if not path or not os.path.isfile(path):
@@ -625,15 +641,21 @@ class MLXWhisperApp:
         return f"🎵 {name} | {size} | {icon} {entry.status}"
 
     def _remove_selected(self):
+        if self.is_running or self.closing:
+            return
         selection = list(self.file_list.curselection())
         for index in reversed(selection):
             self.file_list.delete(index)
             if 0 <= index < len(self.file_entries):
                 self.file_entries.pop(index)
+        self._refresh_retry_button()
 
     def _clear_files(self):
+        if self.is_running or self.closing:
+            return
         self.file_list.delete(0, tk.END)
         self.file_entries.clear()
+        self._refresh_retry_button()
 
     def _select_output_dir(self):
         directory = filedialog.askdirectory(title="Select output folder")
@@ -702,8 +724,8 @@ class MLXWhisperApp:
             formats.append("json")
         return formats
 
-    def _start_queue(self):
-        if self.worker_thread and self.worker_thread.is_alive():
+    def _start_queue(self, retry_only=False):
+        if self.is_running or self.closing or (self.worker_thread and self.worker_thread.is_alive()):
             return
         if self.file_list.size() == 0:
             messagebox.showwarning("No files", "Please add at least one file.")
@@ -713,7 +735,13 @@ class MLXWhisperApp:
             messagebox.showwarning("No formats", "Select at least one output format.")
             return
 
-        self.queue = [entry.path for entry in self.file_entries]
+        entries = [entry for entry in self.file_entries
+                   if not retry_only or entry.status in {"Failed", "Cancelled"}]
+        if not entries:
+            return
+        self.queue_entries = entries
+        self.queue = [entry.path for entry in entries]
+        self.queue_results = []
         # Snapshot Tk values on the UI thread. Changing options mid-run must not
         # change the worker's files or make cleanup target a different output set.
         self.queue_formats = list(formats)
@@ -721,14 +749,29 @@ class MLXWhisperApp:
         self.queue_worker_args = self._build_worker_args("", "")
         self.current_index = -1
         self.cancel_requested = False
+        self.is_running = True
+        for entry in entries:
+            entry.status = "Queued"
+        for idx in range(len(entries)):
+            self._mark_item_status(idx, "Queued")
         self.start_button.configure(state="disabled")
         self.cancel_button.configure(state="normal")
+        self.retry_button.configure(state="disabled")
+        for button in (self.add_button, self.remove_button, self.clear_button):
+            button.configure(state="disabled")
         self.progress.start(10)
         self._set_status("Processing", ACCENT)
         self._log("Starting queue...")
 
         self.worker_thread = threading.Thread(target=self._process_queue, daemon=True)
-        self.worker_thread.start()
+        try:
+            self.worker_thread.start()
+        except RuntimeError as exc:
+            self._log(f"Could not start transcription queue: {exc}")
+            self.queue_results = ["Failed"] * len(self.queue)
+            for idx in range(len(self.queue)):
+                self._mark_item_status(idx, "Failed")
+            self._finish_queue()
 
     def _process_queue(self):
         try:
@@ -762,7 +805,13 @@ class MLXWhisperApp:
                         self.log_queue.put(f"Could not remove temporary output: {exc}")
                     self.current_plan = None
                 self._mark_item_status(idx, status)
+                self.queue_results.append(status)
         finally:
+            # Unstarted jobs in a cancelled queue must remain retryable too.
+            for idx in range(len(self.queue_results), len(self.queue)):
+                status = "Cancelled" if self.cancel_requested else "Failed"
+                self.queue_results.append(status)
+                self._mark_item_status(idx, status)
             self._post_ui(self._finish_queue)
 
     def _run_worker(self, file_path: str, output_dir: str) -> bool:
@@ -884,31 +933,67 @@ class MLXWhisperApp:
         self.cancel_requested = True
         self._log("Cancel requested. Waiting for the worker to stop...")
 
-    def _finish_queue(self):
-        if self.cancel_requested:
-            self._set_status("Cancelled", ERROR)
-            self._log("Cancelled.")
+    def _on_close(self):
+        if self.closing:
+            return
+        self.closing = True
+        if self.is_running or (self.worker_thread and self.worker_thread.is_alive()):
+            self._cancel_processing()
+            self._set_status("Stopping before closing…", TEXT_SECONDARY)
+            self.start_button.configure(state="disabled")
+            self.retry_button.configure(state="disabled")
+            self.cancel_button.configure(state="disabled")
+        self._wait_for_close()
+
+    def _wait_for_close(self):
+        if self.worker_thread and self.worker_thread.is_alive():
+            self.root.after(50, self._wait_for_close)
         else:
-            self._set_status("Idle", TEXT_SECONDARY)
-            self._log("All files completed.")
+            self.root.destroy()
+
+    def _refresh_retry_button(self):
+        retryable = any(entry.status in {"Failed", "Cancelled"} for entry in self.file_entries)
+        enabled = retryable and not self.is_running and not self.closing
+        self.retry_button.configure(state="normal" if enabled else "disabled")
+
+    def _finish_queue(self):
+        succeeded = self.queue_results.count("Done")
+        failed = self.queue_results.count("Failed")
+        cancelled = self.queue_results.count("Cancelled")
+        summary = f"{succeeded} succeeded, {failed} failed, {cancelled} cancelled"
+        if cancelled:
+            self._set_status(f"Cancelled: {summary}", ERROR)
+        elif failed:
+            self._set_status(f"Finished with errors: {summary}", ERROR)
+        else:
+            self._set_status(f"Completed: {summary}", SUCCESS)
+        self._log(summary + ".")
         self.progress.stop()
-        self.start_button.configure(state="normal")
+        self.is_running = False
+        self.start_button.configure(state="disabled" if self.closing else "normal")
         self.cancel_button.configure(state="disabled")
+        for button in (self.add_button, self.remove_button, self.clear_button):
+            button.configure(state="disabled" if self.closing else "normal")
+        self._refresh_retry_button()
         self.current_process = None
         self.cancel_requested = False
         self.current_plan = None
         self.current_file_label.configure(text="")
 
     def _mark_item_status(self, index: int, status: str):
+        entry = self.queue_entries[index]
+
         def update():
-            if 0 <= index < len(self.file_entries):
-                entry = self.file_entries[index]
+            if entry in self.file_entries:
+                # Retry queues contain only a subset of rows. Resolve the entry
+                # instead of applying a retry index to the full visible list.
+                row = self.file_entries.index(entry)
                 entry.status = status
                 label = self._format_entry(entry)
-                self.file_list.delete(index)
-                self.file_list.insert(index, label)
+                self.file_list.delete(row)
+                self.file_list.insert(row, label)
                 color = STATUS_STYLES.get(status, ("•", TEXT_SECONDARY))[1]
-                self.file_list.itemconfig(index, foreground=color)
+                self.file_list.itemconfig(row, foreground=color)
 
         self._post_ui(update)
 

@@ -139,6 +139,7 @@ class QueueSafetyTests(unittest.TestCase):
         self.app.queue_formats = ["txt"]
         self.app.queue_output_root = str(self.root)
         self.app.queue = [str(self.root / "lecture.wav")]
+        self.app.queue_results = []
         self.app._post_ui = lambda callback: callback()
         self.app._update_current_file = lambda text: None
         self.app._log = lambda text: self.app.log_queue.put(text)
@@ -174,6 +175,7 @@ class QueueSafetyTests(unittest.TestCase):
             return True
 
         self.app._run_worker = succeed
+        self.app.queue_results = []
         self.app._process_queue()
         self.assertEqual(old.read_text(), "old")
         self.assertEqual((self.root / "lecture_2.txt").read_text(), "complete")
@@ -193,7 +195,9 @@ class QueueSafetyTests(unittest.TestCase):
         self.app._run_worker = cancel
         self.app._process_queue()
         self.assertEqual(len(started), 1)
-        self.assertEqual(self.statuses[-1], (0, "Cancelled"))
+        self.assertIn((0, "Cancelled"), self.statuses)
+        self.assertEqual(self.statuses[-1], (1, "Cancelled"))
+        self.assertEqual(self.app.queue_results, ["Cancelled", "Cancelled"])
         self.assertEqual(list(self.root.iterdir()), [])
         self.assertEqual(self.finished, [True])
 
