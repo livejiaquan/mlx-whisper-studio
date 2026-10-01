@@ -3,11 +3,14 @@ from __future__ import annotations
 
 import os
 import queue
+import signal
 import subprocess
 import sys
 import threading
 from dataclasses import dataclass
 from typing import List, Optional
+
+from output_files import OutputPlan, cleanup_outputs, prepare_outputs, publish_outputs
 
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
@@ -75,16 +78,10 @@ STATUS_STYLES = {
     "Processing": ("⟳", ACCENT),
     "Done": ("✓", SUCCESS),
     "Failed": ("✗", ERROR),
+    "Cancelled": ("✗", ERROR),
 }
 
 DEFAULT_TRANSLATION_MODEL = "Helsinki-NLP/opus-mt-ja-zh"
-
-
-@dataclass
-class OutputPlan:
-    output_dir: str
-    output_paths: List[str]
-    created_dir: bool
 
 
 @dataclass
@@ -717,6 +714,11 @@ class MLXWhisperApp:
             return
 
         self.queue = [entry.path for entry in self.file_entries]
+        # Snapshot Tk values on the UI thread. Changing options mid-run must not
+        # change the worker's files or make cleanup target a different output set.
+        self.queue_formats = list(formats)
+        self.queue_output_root = self.output_dir_var.get().strip()
+        self.queue_worker_args = self._build_worker_args("", "")
         self.current_index = -1
         self.cancel_requested = False
         self.start_button.configure(state="disabled")
@@ -729,43 +731,116 @@ class MLXWhisperApp:
         self.worker_thread.start()
 
     def _process_queue(self):
-        for idx, file_path in enumerate(self.queue):
-            if self.cancel_requested:
-                break
-            self.current_index = idx
-            self.current_plan = self._build_output_plan(file_path)
-            self._post_ui(
-                lambda: self._update_current_file(
-                    f"Processing {idx + 1}/{len(self.queue)}: {os.path.basename(file_path)}"
+        try:
+            for idx, file_path in enumerate(self.queue):
+                if self.cancel_requested:
+                    break
+                self.current_index = idx
+                self.current_plan = None
+                self._post_ui(
+                    lambda idx=idx, file_path=file_path: self._update_current_file(
+                        f"Processing {idx + 1}/{len(self.queue)}: {os.path.basename(file_path)}"
+                    )
                 )
-            )
-            self._mark_item_status(idx, "Processing")
-            success = self._run_worker(file_path, self.current_plan.output_dir)
-            if success:
-                self._mark_item_status(idx, "Done")
-            else:
-                self._mark_item_status(idx, "Failed")
-                self._cleanup_outputs(self.current_plan)
-
-        self._post_ui(self._finish_queue)
+                self._mark_item_status(idx, "Processing")
+                status = "Failed"
+                try:
+                    self.current_plan = self._build_output_plan(file_path)
+                    success = self._run_worker(file_path, self.current_plan.staging_dir)
+                    if success and not self.cancel_requested:
+                        outputs = publish_outputs(self.current_plan)
+                        self.log_queue.put("Saved: " + ", ".join(outputs))
+                        status = "Done"
+                    elif self.cancel_requested:
+                        status = "Cancelled"
+                except Exception as exc:
+                    self.log_queue.put(f"Transcription failed: {exc}")
+                finally:
+                    try:
+                        self._cleanup_outputs(self.current_plan)
+                    except OSError as exc:
+                        self.log_queue.put(f"Could not remove temporary output: {exc}")
+                    self.current_plan = None
+                self._mark_item_status(idx, status)
+        finally:
+            self._post_ui(self._finish_queue)
 
     def _run_worker(self, file_path: str, output_dir: str) -> bool:
-        args = self._build_worker_args(file_path, output_dir)
-        self.current_process = subprocess.Popen(
+        args = list(self.queue_worker_args)
+        args[args.index("--input") + 1] = file_path
+        args[args.index("--output-dir") + 1] = output_dir
+        if self.cancel_requested:
+            return False
+        process = subprocess.Popen(
             [sys.executable, *args],
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
+            encoding="utf-8",
+            errors="replace",
+            start_new_session=(os.name == "posix"),
         )
-        assert self.current_process.stdout is not None
-        for line in self.current_process.stdout:
-            if self.cancel_requested:
-                break
-            self.log_queue.put(line.rstrip())
-        if self.cancel_requested:
-            self.current_process.terminate()
-            return False
-        return self.current_process.wait() == 0
+        self.current_process = process
+        assert process.stdout is not None
+
+        def read_logs():
+            for line in process.stdout:
+                self.log_queue.put(line.rstrip())
+
+        reader = threading.Thread(target=read_logs, daemon=True)
+        reader.start()
+        try:
+            while True:
+                if self.cancel_requested:
+                    self._stop_worker(process)
+                    return False
+                try:
+                    return process.wait(timeout=0.1) == 0
+                except subprocess.TimeoutExpired:
+                    continue
+        finally:
+            # Reap the worker before cleanup; otherwise it can recreate files
+            # after cancellation or overwrite files belonging to another run.
+            if process.poll() is None:
+                self._stop_worker(process)
+            reader.join(timeout=1)
+            if reader.is_alive():
+                # ffmpeg or another descendant may still own the stdout pipe,
+                # even when the worker itself has exited.
+                self._stop_worker(process)
+                reader.join(timeout=1)
+            if not reader.is_alive():
+                process.stdout.close()
+            else:
+                self.log_queue.put("Worker log stream did not close; stopped waiting.")
+            self.current_process = None
+
+    @staticmethod
+    def _stop_worker(process):
+        def signal_group(sig):
+            try:
+                os.killpg(process.pid, sig)
+            except ProcessLookupError:
+                pass
+
+        if os.name == "posix":
+            # The worker starts its own session; only its descendants belong to
+            # this group. Stop decoders too, without touching unrelated apps.
+            signal_group(signal.SIGTERM)
+        elif process.poll() is None:
+            process.terminate()
+        try:
+            process.wait(timeout=3)
+        except subprocess.TimeoutExpired:
+            if os.name == "posix":
+                signal_group(signal.SIGKILL)
+            else:
+                process.kill()
+            process.wait()
+        finally:
+            if os.name == "posix":
+                # A child may ignore SIGTERM even if the group leader exited.
+                signal_group(signal.SIGKILL)
 
     def _build_worker_args(self, file_path: str, output_dir: str) -> List[str]:
         formats = ",".join(self._selected_formats())
@@ -800,46 +875,14 @@ class MLXWhisperApp:
         return args
 
     def _build_output_plan(self, file_path: str) -> OutputPlan:
-        formats = self._selected_formats()
-        base = os.path.splitext(os.path.basename(file_path))[0]
-        output_root = self.output_dir_var.get().strip() or os.path.dirname(file_path)
-        if not output_root:
-            output_root = os.getcwd()
-        output_dir = output_root
-        created_dir = False
-        if len(formats) > 1:
-            output_dir = os.path.join(output_root, f"{base}_outputs")
-            if not os.path.exists(output_dir):
-                os.makedirs(output_dir, exist_ok=True)
-                created_dir = True
-        else:
-            os.makedirs(output_dir, exist_ok=True)
-        output_paths = [os.path.join(output_dir, f"{base}.{fmt}") for fmt in formats]
-        return OutputPlan(output_dir=output_dir, output_paths=output_paths, created_dir=created_dir)
+        return prepare_outputs(file_path, self.queue_formats, self.queue_output_root)
 
     def _cleanup_outputs(self, plan: OutputPlan | None):
-        if not plan:
-            return
-        for path in plan.output_paths:
-            if os.path.exists(path):
-                try:
-                    os.remove(path)
-                except OSError:
-                    pass
-        if plan.created_dir:
-            try:
-                if not os.listdir(plan.output_dir):
-                    os.rmdir(plan.output_dir)
-            except OSError:
-                pass
+        cleanup_outputs(plan)
 
     def _cancel_processing(self):
-        if not self.current_process:
-            return
         self.cancel_requested = True
-        self._log("Cancel requested. Cleaning outputs...")
-        self.current_process.terminate()
-        self._cleanup_outputs(self.current_plan)
+        self._log("Cancel requested. Waiting for the worker to stop...")
 
     def _finish_queue(self):
         if self.cancel_requested:

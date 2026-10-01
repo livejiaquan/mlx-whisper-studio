@@ -43,6 +43,12 @@ This creates a `venv/` and installs the dependencies from `requirements.txt`.
 - Output is written next to the input file by default.
 - When more than one output format is selected, files are saved in a subfolder
   named `<input_basename>_outputs`.
+- Each GUI job writes into a private temporary folder first. Failed or cancelled
+  jobs remove only their own temporary files, preserving earlier transcripts.
+- Successful GUI jobs never overwrite existing outputs: a repeated name gets
+  `_2`, `_3`, etc. The same suffix is used for the whole set, including translations.
+- Cancel waits for the worker to stop before cleaning up. Settings are captured
+  when you start the queue, so edits during a run apply to the next run.
 - Models download on first use and are cached afterward.
 - "Custom" language accepts any Whisper language code (e.g. `zh`, `ja`).
 - "Custom model" accepts a Hugging Face repo ID or a local model path.
@@ -53,4 +59,18 @@ This creates a `venv/` and installs the dependencies from `requirements.txt`.
 
 - `app.py` — Tkinter GUI: file queue, drag-and-drop, settings, log output
 - `mlx_worker.py` — CLI worker that runs MLX Whisper and writes the output files
+- `output_files.py` — staged output publication and existing-file protection
 - `setup.sh` / `run.sh` — environment setup and launch helpers
+
+## Development checks
+
+Output safety and queue lifecycle tests use only Python's standard library
+(including Tkinter). They do not open a GUI, run MLX, or download models:
+
+```bash
+python -m unittest discover -s tests -v
+python -m compileall -q app.py mlx_worker.py output_files.py tests
+```
+
+Actual speech recognition and native GUI interaction still need an Apple Silicon
+Mac with the application dependencies installed.
